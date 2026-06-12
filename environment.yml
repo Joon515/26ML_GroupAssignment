@@ -1,0 +1,27 @@
+name: 26ml
+
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python
+  - python=3.13
+
+  - numpy
+  - scipy
+  - scikit-learn
+  - matplotlib
+
+  - pillow
+  - opencv
+
+  - pytorch
+  - torchvision
+
+  - pip
+
+  # 如果后面有 pip-only 包可以放这里
+  - pip:
+      - tqdm
