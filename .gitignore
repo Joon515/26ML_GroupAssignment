@@ -1,0 +1,18 @@
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+
+
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.tflite
+*.tif
+*.zip
+
+data/dataset/*
+.vscode/*
+
+

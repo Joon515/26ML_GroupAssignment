@@ -1,0 +1,295 @@
+{
+  "parser_config": {
+    "image_size": 32,
+    "crop_black_border": true,
+    "normalize": true,
+    "random_rotation": true,
+    "color_jitter": true,
+    "clahe": true,
+    "rotation_degrees": 20.0,
+    "jitter_brightness": 0.2,
+    "jitter_contrast": 0.2,
+    "jitter_saturation": 0.2,
+    "clahe_clip_limit": 2.0,
+    "clahe_tile_grid_size": 8
+  },
+  "architectures": {
+    "resnet18": {
+      "folds": [
+        {
+          "lesion_accuracy": 0.125,
+          "lesion_macro_f1": 0.05555555555555555,
+          "lesion_confusion_matrix": [
+            [
+              0,
+              109,
+              0,
+              0
+            ],
+            [
+              0,
+              30,
+              0,
+              0
+            ],
+            [
+              0,
+              50,
+              0,
+              0
+            ],
+            [
+              0,
+              51,
+              0,
+              0
+            ]
+          ],
+          "edema_accuracy": 0.7833333333333333,
+          "edema_macro_f1": 0.2935206869633099,
+          "edema_confusion_matrix": [
+            [
+              188,
+              7,
+              0
+            ],
+            [
+              15,
+              0,
+              0
+            ],
+            [
+              29,
+              1,
+              0
+            ]
+          ],
+          "arch": "18",
+          "fold": 1,
+          "train_count": 960,
+          "val_count": 240
+        },
+        {
+          "lesion_accuracy": 0.3375,
+          "lesion_macro_f1": 0.20367563965764865,
+          "lesion_confusion_matrix": [
+            [
+              67,
+              0,
+              36,
+              6
+            ],
+            [
+              17,
+              0,
+              10,
+              3
+            ],
+            [
+              34,
+              0,
+              8,
+              8
+            ],
+            [
+              34,
+              0,
+              11,
+              6
+            ]
+          ],
+          "edema_accuracy": 0.06666666666666667,
+          "edema_macro_f1": 0.05988455988455988,
+          "edema_confusion_matrix": [
+            [
+              0,
+              193,
+              2
+            ],
+            [
+              0,
+              15,
+              0
+            ],
+            [
+              0,
+              29,
+              1
+            ]
+          ],
+          "arch": "18",
+          "fold": 2,
+          "train_count": 960,
+          "val_count": 240
+        },
+        {
+          "lesion_accuracy": 0.13333333333333333,
+          "lesion_macro_f1": 0.058823529411764705,
+          "lesion_confusion_matrix": [
+            [
+              0,
+              110,
+              0,
+              0
+            ],
+            [
+              0,
+              32,
+              0,
+              0
+            ],
+            [
+              0,
+              48,
+              0,
+              0
+            ],
+            [
+              0,
+              50,
+              0,
+              0
+            ]
+          ],
+          "edema_accuracy": 0.0625,
+          "edema_macro_f1": 0.0392156862745098,
+          "edema_confusion_matrix": [
+            [
+              0,
+              195,
+              0
+            ],
+            [
+              0,
+              15,
+              0
+            ],
+            [
+              0,
+              30,
+              0
+            ]
+          ],
+          "arch": "18",
+          "fold": 3,
+          "train_count": 960,
+          "val_count": 240
+        },
+        {
+          "lesion_accuracy": 0.45416666666666666,
+          "lesion_macro_f1": 0.15616045845272206,
+          "lesion_confusion_matrix": [
+            [
+              109,
+              0,
+              0,
+              0
+            ],
+            [
+              31,
+              0,
+              0,
+              0
+            ],
+            [
+              49,
+              0,
+              0,
+              0
+            ],
+            [
+              51,
+              0,
+              0,
+              0
+            ]
+          ],
+          "edema_accuracy": 0.8125,
+          "edema_macro_f1": 0.2988505747126437,
+          "edema_confusion_matrix": [
+            [
+              195,
+              0,
+              0
+            ],
+            [
+              15,
+              0,
+              0
+            ],
+            [
+              30,
+              0,
+              0
+            ]
+          ],
+          "arch": "18",
+          "fold": 4,
+          "train_count": 960,
+          "val_count": 240
+        },
+        {
+          "lesion_accuracy": 0.3458333333333333,
+          "lesion_macro_f1": 0.21249473240623684,
+          "lesion_confusion_matrix": [
+            [
+              53,
+              0,
+              3,
+              53
+            ],
+            [
+              17,
+              0,
+              0,
+              13
+            ],
+            [
+              27,
+              0,
+              1,
+              22
+            ],
+            [
+              20,
+              0,
+              2,
+              29
+            ]
+          ],
+          "edema_accuracy": 0.8083333333333333,
+          "edema_macro_f1": 0.2980030721966206,
+          "edema_confusion_matrix": [
+            [
+              194,
+              0,
+              0
+            ],
+            [
+              15,
+              0,
+              0
+            ],
+            [
+              31,
+              0,
+              0
+            ]
+          ],
+          "arch": "18",
+          "fold": 5,
+          "train_count": 960,
+          "val_count": 240
+        }
+      ],
+      "lesion_accuracy_mean": 0.2791666666666667,
+      "lesion_accuracy_std": 0.12923385349392352,
+      "lesion_macro_f1_mean": 0.13734198309678555,
+      "lesion_macro_f1_std": 0.06820028157606006,
+      "edema_accuracy_mean": 0.5066666666666666,
+      "edema_accuracy_std": 0.36109978614720273,
+      "edema_macro_f1_mean": 0.19789491600632877,
+      "edema_macro_f1_std": 0.12131276303580237
+    }
+  }
+}

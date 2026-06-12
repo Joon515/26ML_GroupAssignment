@@ -1,0 +1,10 @@
+datasets
+pyarrow
+torch
+torchvision
+matplotlib
+scikit-learn
+opencv-python
+pandas
+tqdm
+netron
