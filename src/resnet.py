@@ -17,10 +17,14 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import models
 
 try:
-    from .parser import ALL_PARSER_STEPS, ParserConfig, config_from_enabled, load_rgb, parse_image
+    from .preprocess import ALL_PREPROCESS_STEPS, PreprocessConfig, config_from_enabled, load_rgb, preprocess_image
 except ImportError:
-    from parser import ALL_PARSER_STEPS, ParserConfig, config_from_enabled, load_rgb, parse_image
+    from preprocess import ALL_PREPROCESS_STEPS, PreprocessConfig, config_from_enabled, load_rgb, preprocess_image
 
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "data" / "messidor"
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "output"
 
 @dataclass(frozen=True)
 class MessidorRecord:
@@ -30,10 +34,10 @@ class MessidorRecord:
 
 
 class MessidorDataset(Dataset[tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]]):
-    def __init__(self, records: list[MessidorRecord], parser_config: ParserConfig, train: bool,
+    def __init__(self, records: list[MessidorRecord], preprocess_config: PreprocessConfig, train: bool,
                  seed: int = 0) -> None:
         self.records = records
-        self.parser_config = parser_config
+        self.preprocess_config = preprocess_config
         self.train = train
         self.seed = seed
         self.epoch = 0
@@ -48,8 +52,8 @@ class MessidorDataset(Dataset[tuple[torch.Tensor, tuple[torch.Tensor, torch.Tens
         record = self.records[index]
         image = load_rgb(record.image_path)
         rng = random.Random(self.seed + self.epoch * 1_000_003 + index) if self.train else None
-        parsed = parse_image(image, self.parser_config, train=self.train, rng=rng)
-        tensor = torch.from_numpy(parsed).permute(2, 0, 1).float()
+        preprocessed = preprocess_image(image, self.preprocess_config, train=self.train, rng=rng)
+        tensor = torch.from_numpy(preprocessed).permute(2, 0, 1).float()
         return tensor, (torch.tensor(record.lesion_risk, dtype=torch.long),
                         torch.tensor(record.edema_risk, dtype=torch.long))
 
@@ -75,9 +79,8 @@ def _read_csv(csv_path: Path, image_dir: Path) -> list[MessidorRecord]:
 
 
 def load_messidor_records(data_root: Path) -> list[MessidorRecord]:
-    dataset = data_root / "dataset"
-    records = _read_csv(dataset / "train.csv", dataset / "train")
-    records.extend(_read_csv(dataset / "test.csv", dataset / "test"))
+    records = _read_csv(data_root / "train.csv", data_root / "train")
+    records.extend(_read_csv(data_root / "test.csv", data_root / "test"))
     return records
 
 
@@ -151,12 +154,12 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict
 
 
 def train_one_fold(arch: str, fold: int, train_records: list[MessidorRecord], val_records: list[MessidorRecord],
-                   parser_config: ParserConfig, args: argparse.Namespace, device: torch.device) -> dict[str, object]:
-    train_dataset = MessidorDataset(train_records, parser_config, train=True, seed=args.seed + fold * 10_000)
+                   preprocess_config: PreprocessConfig, args: argparse.Namespace, device: torch.device) -> dict[str, object]:
+    train_dataset = MessidorDataset(train_records, preprocess_config, train=True, seed=args.seed + fold * 10_000)
     sampler = WeightedRandomSampler(sample_weights(train_records), num_samples=len(train_records), replacement=True)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler,
                               num_workers=args.num_workers, pin_memory=device.type == "cuda")
-    val_loader = DataLoader(MessidorDataset(val_records, parser_config, train=False), batch_size=args.batch_size,
+    val_loader = DataLoader(MessidorDataset(val_records, preprocess_config, train=False), batch_size=args.batch_size,
                             shuffle=False, num_workers=args.num_workers, pin_memory=device.type == "cuda")
     model = make_model(arch, pretrained=args.pretrained).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -197,24 +200,24 @@ def aggregate(results: list[dict[str, object]]) -> dict[str, object]:
 
 def run_cross_validation(args: argparse.Namespace) -> dict[str, object]:
     set_seed(args.seed)
-    records = load_messidor_records(Path(args.data_root))
+    records = load_messidor_records(Path(args.data_root).expanduser())
     if args.limit:
         records = records[:args.limit]
-    parser_config = config_from_enabled(args.parser_steps, args.image_size)
+    preprocess_config = config_from_enabled(args.preprocess_steps, args.image_size)
     labels = stratification_labels(records)
     splitter = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    all_results: dict[str, object] = {"parser_config": asdict(parser_config), "architectures": {}}
+    all_results: dict[str, object] = {"preprocess_config": asdict(preprocess_config), "architectures": {}}
     indices = np.arange(len(records))
     for arch in args.architectures:
         arch_results: list[dict[str, object]] = []
         for fold, (train_idx, val_idx) in enumerate(splitter.split(indices, labels), start=1):
             train_records = [records[int(i)] for i in train_idx]
             val_records = [records[int(i)] for i in val_idx]
-            arch_results.append(train_one_fold(arch, fold, train_records, val_records, parser_config, args, device))
+            arch_results.append(train_one_fold(arch, fold, train_records, val_records, preprocess_config, args, device))
         all_results["architectures"][f"resnet{arch}"] = aggregate(arch_results)  # type: ignore[index]
 
     result_path = output_dir / "cross_validation_results.json"
@@ -222,28 +225,28 @@ def run_cross_validation(args: argparse.Namespace) -> dict[str, object]:
     return all_results
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Messidor ResNet 5-fold cross validation")
-    parser.add_argument("--data-root", default="data")
-    parser.add_argument("--output-dir", default="output/resnet")
-    parser.add_argument("--architectures", nargs="+", default=["18", "34", "50", "101"], choices=["18", "34", "50", "101"])
-    parser.add_argument("--parser-steps", nargs="+", default=list(ALL_PARSER_STEPS), choices=list(ALL_PARSER_STEPS))
-    parser.add_argument("--folds", type=int, default=5)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="")
-    parser.add_argument("--pretrained", action="store_true")
-    parser.add_argument("--limit", type=int, default=0, help="Smoke-test limit; leave 0 for full dataset")
-    return parser
+def build_cli() -> argparse.ArgumentParser:
+    cli = argparse.ArgumentParser(description="Messidor ResNet 5-fold cross validation")
+    cli.add_argument("--data-root", dest="data_root", default=str(DEFAULT_DATA_ROOT))
+    cli.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_ROOT / "resnet"))
+    cli.add_argument("--architectures", nargs="+", default=["18", "34", "50", "101"], choices=["18", "34", "50", "101"])
+    cli.add_argument("--preprocess-steps", nargs="+", default=list(ALL_PREPROCESS_STEPS), choices=list(ALL_PREPROCESS_STEPS))
+    cli.add_argument("--folds", type=int, default=5)
+    cli.add_argument("--epochs", type=int, default=10)
+    cli.add_argument("--batch-size", type=int, default=16)
+    cli.add_argument("--lr", type=float, default=1e-4)
+    cli.add_argument("--weight-decay", type=float, default=1e-4)
+    cli.add_argument("--image-size", type=int, default=224)
+    cli.add_argument("--num-workers", type=int, default=2)
+    cli.add_argument("--seed", type=int, default=42)
+    cli.add_argument("--device", default="")
+    cli.add_argument("--pretrained", action="store_true")
+    cli.add_argument("--limit", type=int, default=0, help="Smoke-test limit; leave 0 for full dataset")
+    return cli
 
 
 def main() -> None:
-    args = build_arg_parser().parse_args()
+    args = build_cli().parse_args()
     run_cross_validation(args)
 
 

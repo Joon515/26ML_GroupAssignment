@@ -1,1 +1,1 @@
-"""Messidor parser and ResNet training package."""
+"""Messidor preprocess and ResNet training package."""

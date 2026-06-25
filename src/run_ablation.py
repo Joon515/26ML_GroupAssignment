@@ -6,33 +6,31 @@ import json
 from pathlib import Path
 
 try:
-    from .parser import ALL_PARSER_STEPS
-    from .resnet import build_arg_parser, run_cross_validation
+    from .preprocess import ALL_PREPROCESS_STEPS
+    from .resnet import DEFAULT_OUTPUT_ROOT, build_cli, run_cross_validation
 except ImportError:
-    from parser import ALL_PARSER_STEPS
-    from resnet import build_arg_parser, run_cross_validation
+    from preprocess import ALL_PREPROCESS_STEPS
+    from resnet import DEFAULT_OUTPUT_ROOT, build_cli, run_cross_validation
 
 
 ABLATIONS: dict[str, list[str]] = {
     "none": [],
-    "crop": ["crop"],
-    "crop_normalize": ["crop", "normalize"],
-    "crop_normalize_rotate": ["crop", "normalize", "rotate"],
-    "crop_normalize_rotate_jitter": ["crop", "normalize", "rotate", "jitter"],
-    "full": list(ALL_PARSER_STEPS),
+    "normalize": ["normalize"],
+    "normalize_rotate": ["normalize", "rotate"],
+    "full": list(ALL_PREPROCESS_STEPS),
 }
 
 
 def main() -> None:
-    parent = build_arg_parser()
-    parent.description = "Run parser ablations with Messidor ResNet cross validation"
-    parent.add_argument("--ablation-output-root", default="output/ablations")
+    parent = build_cli()
+    parent.description = "Run preprocess ablations with Messidor ResNet cross validation"
+    parent.add_argument("--ablation-output-root", default=str(DEFAULT_OUTPUT_ROOT / "ablations"))
     args = parent.parse_args()
-    root = Path(args.ablation_output_root)
+    root = Path(args.ablation_output_root).expanduser()
     summaries: dict[str, object] = {}
     for name, steps in ABLATIONS.items():
         run_args = copy.copy(args)
-        run_args.parser_steps = steps
+        run_args.preprocess_steps = steps
         run_args.output_dir = str(root / name)
         summaries[name] = run_cross_validation(run_args)
     root.mkdir(parents=True, exist_ok=True)

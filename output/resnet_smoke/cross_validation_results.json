@@ -1,15 +1,10 @@
 {
-  "parser_config": {
+  "preprocess_config": {
     "image_size": 32,
-    "crop_black_border": true,
     "normalize": true,
     "random_rotation": true,
-    "color_jitter": true,
     "clahe": true,
     "rotation_degrees": 20.0,
-    "jitter_brightness": 0.2,
-    "jitter_contrast": 0.2,
-    "jitter_saturation": 0.2,
     "clahe_clip_limit": 2.0,
     "clahe_tile_grid_size": 8
   },
