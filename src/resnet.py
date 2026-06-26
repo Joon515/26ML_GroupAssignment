@@ -9,10 +9,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from typing import Any, cast
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, f1_score, recall_score
 from sklearn.model_selection import StratifiedKFold
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import models
 
@@ -84,7 +84,7 @@ def load_messidor_records(data_root: Path) -> list[MessidorRecord]:
     return records
 
 
-def make_model(arch: str, pretrained: bool = False) -> nn.Module:
+def make_model(arch: str, pretrained: bool = False, classifier: str = "normed") -> nn.Module:
     builders = {
         "18": (models.resnet18, models.ResNet18_Weights.DEFAULT),
         "34": (models.resnet34, models.ResNet34_Weights.DEFAULT),
@@ -96,15 +96,26 @@ def make_model(arch: str, pretrained: bool = False) -> nn.Module:
     builder, weights = builders[arch]
     model = builder(weights=weights if pretrained else None)
     in_features = model.fc.in_features
-    model.fc = MessidorHead(in_features)
+    model.fc = MessidorHead(in_features, classifier=classifier)
     return model
 
 
-class MessidorHead(nn.Module):
-    def __init__(self, in_features: int) -> None:
+class NormedLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
-        self.lesion = nn.Linear(in_features, 4)
-        self.edema = nn.Linear(in_features, 3)
+        self.weight = nn.Parameter(torch.empty(in_features, out_features))
+        self.weight.data.uniform_(-1.0, 1.0).renorm_(2, 1, 1e-5).mul_(1e5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(x, dim=1).mm(F.normalize(self.weight, dim=0))
+
+
+class MessidorHead(nn.Module):
+    def __init__(self, in_features: int, classifier: str = "normed") -> None:
+        super().__init__()
+        head = NormedLinear if classifier == "normed" else nn.Linear
+        self.lesion = head(in_features, 4)
+        self.edema = head(in_features, 3)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.lesion(x), self.edema(x)
@@ -119,14 +130,96 @@ def set_seed(seed: int) -> None:
 
 def stratification_labels(records: list[MessidorRecord]) -> list[str]:
     return [f"{record.lesion_risk}-{record.edema_risk}" for record in records]
-def sample_weights(records: list[MessidorRecord]) -> torch.DoubleTensor:
-    counts: dict[str, int] = {}
+
+
+def class_counts(records: list[MessidorRecord], target: str, num_classes: int) -> list[int]:
+    counts = [0] * num_classes
+    for record in records:
+        label = record.lesion_risk if target == "lesion" else record.edema_risk
+        counts[label] += 1
+    return counts
+
+
+def _effective_class_weights(counts: list[int], beta: float) -> np.ndarray:
+    count_array = np.asarray(counts, dtype=np.float64)
+    present = count_array > 0
+    weights = np.zeros_like(count_array, dtype=np.float64)
+    if not present.any():
+        return weights
+    if beta <= 0.0:
+        weights[present] = 1.0
+    else:
+        effective_num = 1.0 - np.power(beta, count_array[present])
+        weights[present] = (1.0 - beta) / effective_num
+    weights[present] = weights[present] / weights[present].sum() * float(present.sum())
+    return weights
+
+
+def drw_weights(counts: list[int], epoch: int, start_epoch: int, beta: float, device: torch.device) -> torch.Tensor | None:
+    if start_epoch <= 0 or epoch < start_epoch:
+        return None
+    weights = _effective_class_weights(counts, beta)
+    return torch.as_tensor(weights, dtype=torch.float32, device=device)
+
+
+def sample_weights(records: list[MessidorRecord], beta: float = 0.9999,
+                   power: float = 0.5, joint_weight: float = 0.5) -> torch.DoubleTensor:
+    if power <= 0.0:
+        return torch.ones(len(records), dtype=torch.double)
+    lesion_weights = _effective_class_weights(class_counts(records, "lesion", 4), beta)
+    edema_weights = _effective_class_weights(class_counts(records, "edema", 3), beta)
+    joint_counts: dict[str, int] = {}
     for label in stratification_labels(records):
-        counts[label] = counts.get(label, 0) + 1
-    weights = [1.0 / counts[f"{record.lesion_risk}-{record.edema_risk}"] for record in records]
-    return torch.DoubleTensor(weights)
+        joint_counts[label] = joint_counts.get(label, 0) + 1
+    joint_raw = _effective_class_weights(list(joint_counts.values()), beta)
+    joint_weights = dict(zip(joint_counts.keys(), joint_raw, strict=True))
+
+    weights = [
+        (lesion_weights[record.lesion_risk]
+         + edema_weights[record.edema_risk]
+         + joint_weight * joint_weights[f"{record.lesion_risk}-{record.edema_risk}"])
+        / (2.0 + joint_weight)
+        for record in records
+    ]
+    weights_array = np.power(np.asarray(weights, dtype=np.float64), power)
+    weights_array = weights_array / weights_array.mean()
+    return torch.as_tensor(weights_array, dtype=torch.double)
 
 
+class LDAMLoss(nn.Module):
+    def __init__(self, cls_num_list: list[int], max_m: float = 0.5, s: float = 30.0) -> None:
+        super().__init__()
+        safe_counts = np.maximum(np.asarray(cls_num_list, dtype=np.float64), 1.0)
+        margins = 1.0 / np.sqrt(np.sqrt(safe_counts))
+        margins = margins * (max_m / margins.max())
+        self.register_buffer("m_list", torch.as_tensor(margins, dtype=torch.float32))
+        self.s = s
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor, weight: torch.Tensor | None = None) -> torch.Tensor:
+        index = torch.zeros_like(logits, dtype=torch.bool)
+        index.scatter_(1, target.view(-1, 1), True)
+        batch_m = self.m_list[target].view(-1, 1).to(dtype=logits.dtype)
+        adjusted_logits = torch.where(index, logits - batch_m, logits)
+        return F.cross_entropy(self.s * adjusted_logits, target, weight=weight)
+
+
+def task_loss(loss_type: str, criterion: LDAMLoss | None, logits: torch.Tensor,
+              target: torch.Tensor, weight: torch.Tensor | None) -> torch.Tensor:
+    if loss_type == "ce":
+        return F.cross_entropy(logits, target, weight=weight)
+    if criterion is None:
+        raise ValueError("LDAM criterion is required when loss_type='ldam'")
+    return criterion(logits, target, weight)
+
+
+def task_metrics(name: str, true: list[int], pred: list[int], labels: list[int]) -> dict[str, object]:
+    return {
+        f"{name}_accuracy": accuracy_score(true, pred),
+        f"{name}_balanced_accuracy": balanced_accuracy_score(true, pred),
+        f"{name}_macro_f1": f1_score(true, pred, labels=labels, average="macro", zero_division=0),
+        f"{name}_per_class_recall": recall_score(true, pred, labels=labels, average=None, zero_division=0).tolist(),
+        f"{name}_confusion_matrix": confusion_matrix(true, pred, labels=labels).tolist(),
+    }
 
 
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict[str, object]:
@@ -143,30 +236,50 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict
             edema_true.extend(edema_targets.tolist())
             lesion_pred.extend(lesion_logits.argmax(dim=1).cpu().tolist())
             edema_pred.extend(edema_logits.argmax(dim=1).cpu().tolist())
-    return {
-        "lesion_accuracy": accuracy_score(lesion_true, lesion_pred),
-        "lesion_macro_f1": f1_score(lesion_true, lesion_pred, average="macro", zero_division=0),
-        "lesion_confusion_matrix": confusion_matrix(lesion_true, lesion_pred, labels=[0, 1, 2, 3]).tolist(),
-        "edema_accuracy": accuracy_score(edema_true, edema_pred),
-        "edema_macro_f1": f1_score(edema_true, edema_pred, average="macro", zero_division=0),
-        "edema_confusion_matrix": confusion_matrix(edema_true, edema_pred, labels=[0, 1, 2]).tolist(),
+    metrics = {
+        **task_metrics("lesion", lesion_true, lesion_pred, [0, 1, 2, 3]),
+        **task_metrics("edema", edema_true, edema_pred, [0, 1, 2]),
     }
+    metrics["mean_macro_f1"] = (float(metrics["lesion_macro_f1"]) + float(metrics["edema_macro_f1"])) / 2.0
+    metrics["mean_balanced_accuracy"] = (
+        float(metrics["lesion_balanced_accuracy"]) + float(metrics["edema_balanced_accuracy"])
+    ) / 2.0
+    return metrics
 
 
 def train_one_fold(arch: str, fold: int, train_records: list[MessidorRecord], val_records: list[MessidorRecord],
                    preprocess_config: PreprocessConfig, args: argparse.Namespace, device: torch.device) -> dict[str, object]:
     train_dataset = MessidorDataset(train_records, preprocess_config, train=True, seed=args.seed + fold * 10_000)
-    sampler = WeightedRandomSampler(sample_weights(train_records), num_samples=len(train_records), replacement=True)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler,
+    sampler = None
+    if args.sampler_power > 0.0:
+        sampler_generator = torch.Generator()
+        sampler_generator.manual_seed(args.seed + fold * 100_003)
+        sampler = WeightedRandomSampler(
+            sample_weights(train_records, beta=args.sampler_beta, power=args.sampler_power,
+                           joint_weight=args.sampler_joint_weight),
+            num_samples=len(train_records),
+            replacement=True,
+            generator=sampler_generator,
+        )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, shuffle=sampler is None,
                               num_workers=args.num_workers, pin_memory=device.type == "cuda")
     val_loader = DataLoader(MessidorDataset(val_records, preprocess_config, train=False), batch_size=args.batch_size,
                             shuffle=False, num_workers=args.num_workers, pin_memory=device.type == "cuda")
-    model = make_model(arch, pretrained=args.pretrained).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = nn.CrossEntropyLoss()
+    model = make_model(arch, pretrained=args.pretrained, classifier=args.classifier).to(device)
+    if args.optimizer == "sgd":
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
+                                    weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    lesion_counts = class_counts(train_records, "lesion", 4)
+    edema_counts = class_counts(train_records, "edema", 3)
+    lesion_criterion = LDAMLoss(lesion_counts, max_m=args.ldam_max_m, s=args.ldam_scale).to(device)
+    edema_criterion = LDAMLoss(edema_counts, max_m=args.ldam_max_m, s=args.ldam_scale).to(device)
 
     for epoch in range(1, args.epochs + 1):
         train_dataset.set_epoch(epoch)
+        lesion_weights = drw_weights(lesion_counts, epoch, args.drw_start_epoch, args.drw_beta, device)
+        edema_weights = drw_weights(edema_counts, epoch, args.drw_start_epoch, args.drw_beta, device)
         model.train()
         running_loss = 0.0
         for images, (lesion_targets, edema_targets) in train_loader:
@@ -175,12 +288,17 @@ def train_one_fold(arch: str, fold: int, train_records: list[MessidorRecord], va
             edema_targets = edema_targets.to(device)
             optimizer.zero_grad(set_to_none=True)
             lesion_logits, edema_logits = model(images)
-            loss = criterion(lesion_logits, lesion_targets) + criterion(edema_logits, edema_targets)
+            loss = (
+                task_loss(args.loss_type, lesion_criterion, lesion_logits, lesion_targets, lesion_weights)
+                + task_loss(args.loss_type, edema_criterion, edema_logits, edema_targets, edema_weights)
+            )
             loss.backward()
             optimizer.step()
             running_loss += float(loss.item()) * images.size(0)
         metrics = evaluate(model, val_loader, device)
         print(json.dumps({"arch": arch, "fold": fold, "epoch": epoch,
+                          "loss_type": args.loss_type, "drw_active": lesion_weights is not None,
+                          "sampler_active": sampler is not None,
                           "train_loss": running_loss / len(train_records), **metrics}, ensure_ascii=False))
 
     final_metrics = evaluate(model, val_loader, device)
@@ -189,7 +307,11 @@ def train_one_fold(arch: str, fold: int, train_records: list[MessidorRecord], va
 
 
 def aggregate(results: list[dict[str, object]]) -> dict[str, object]:
-    numeric_keys = ["lesion_accuracy", "lesion_macro_f1", "edema_accuracy", "edema_macro_f1"]
+    numeric_keys = [
+        "lesion_accuracy", "lesion_balanced_accuracy", "lesion_macro_f1",
+        "edema_accuracy", "edema_balanced_accuracy", "edema_macro_f1",
+        "mean_macro_f1", "mean_balanced_accuracy",
+    ]
     summary: dict[str, object] = {"folds": results}
     for key in numeric_keys:
         values = np.array([float(result[key]) for result in results], dtype=np.float64)
@@ -210,7 +332,19 @@ def run_cross_validation(args: argparse.Namespace) -> dict[str, object]:
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    all_results: dict[str, object] = {"preprocess_config": asdict(preprocess_config), "architectures": {}}
+    all_results: dict[str, object] = {
+        "preprocess_config": asdict(preprocess_config),
+        "training_config": {
+            "loss_type": args.loss_type,
+            "classifier": args.classifier,
+            "optimizer": args.optimizer,
+            "pretrained": args.pretrained,
+            "drw_start_epoch": args.drw_start_epoch,
+            "sampler_power": args.sampler_power,
+            "sampler_joint_weight": args.sampler_joint_weight,
+        },
+        "architectures": {},
+    }
     indices = np.arange(len(records))
     for arch in args.architectures:
         arch_results: list[dict[str, object]] = []
@@ -219,6 +353,12 @@ def run_cross_validation(args: argparse.Namespace) -> dict[str, object]:
             val_records = [records[int(i)] for i in val_idx]
             arch_results.append(train_one_fold(arch, fold, train_records, val_records, preprocess_config, args, device))
         all_results["architectures"][f"resnet{arch}"] = aggregate(arch_results)  # type: ignore[index]
+    architectures = all_results["architectures"]
+    best_arch = max(architectures, key=lambda name: architectures[name]["mean_macro_f1_mean"])  # type: ignore[index]
+    all_results["best_architecture"] = {
+        "name": best_arch,
+        "mean_macro_f1": architectures[best_arch]["mean_macro_f1_mean"],  # type: ignore[index]
+    }
 
     result_path = output_dir / "cross_validation_results.json"
     result_path.write_text(json.dumps(all_results, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -232,15 +372,29 @@ def build_cli() -> argparse.ArgumentParser:
     cli.add_argument("--architectures", nargs="+", default=["18", "34", "50", "101"], choices=["18", "34", "50", "101"])
     cli.add_argument("--preprocess-steps", nargs="+", default=list(ALL_PREPROCESS_STEPS), choices=list(ALL_PREPROCESS_STEPS))
     cli.add_argument("--folds", type=int, default=5)
-    cli.add_argument("--epochs", type=int, default=10)
+    cli.add_argument("--epochs", type=int, default=50)
     cli.add_argument("--batch-size", type=int, default=16)
-    cli.add_argument("--lr", type=float, default=1e-4)
+    cli.add_argument("--lr", type=float, default=1e-3)
     cli.add_argument("--weight-decay", type=float, default=1e-4)
+    cli.add_argument("--optimizer", default="sgd", choices=["sgd", "adamw"])
+    cli.add_argument("--momentum", type=float, default=0.9)
+    cli.add_argument("--loss-type", default="ldam", choices=["ce", "ldam"])
+    cli.add_argument("--classifier", default="normed", choices=["linear", "normed"])
+    cli.add_argument("--ldam-max-m", type=float, default=0.5)
+    cli.add_argument("--ldam-scale", type=float, default=30.0)
+    cli.add_argument("--drw-beta", type=float, default=0.9999)
+    cli.add_argument("--drw-start-epoch", type=int, default=31,
+                     help="1-based epoch to enable DRW; 0 disables DRW")
+    cli.add_argument("--sampler-beta", type=float, default=0.9999)
+    cli.add_argument("--sampler-power", type=float, default=0.25,
+                     help="0 disables sampler; 1.0 is full effective-number weighting")
+    cli.add_argument("--sampler-joint-weight", type=float, default=0.25,
+                     help="Contribution of the joint lesion-edema label to sample weights")
     cli.add_argument("--image-size", type=int, default=224)
     cli.add_argument("--num-workers", type=int, default=2)
     cli.add_argument("--seed", type=int, default=42)
     cli.add_argument("--device", default="")
-    cli.add_argument("--pretrained", action="store_true")
+    cli.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     cli.add_argument("--limit", type=int, default=0, help="Smoke-test limit; leave 0 for full dataset")
     return cli
 
